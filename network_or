@@ -1,0 +1,301 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+from torch.autograd import Variable
+import math
+
+
+class _Residual_Block(nn.Module):
+    def __init__(self):
+        super(_Residual_Block, self).__init__()
+
+        self.conv1 = nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=1, padding=1, bias=False)
+        self.in1 = nn.InstanceNorm2d(64, affine=True)
+        self.relu = nn.LeakyReLU(0.2, inplace=True)
+        self.conv2 = nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=1, padding=1, bias=False)
+        self.in2 = nn.InstanceNorm2d(64, affine=True)
+
+    def forward(self, x):
+        identity_data = x
+        output = self.relu(self.in1(self.conv1(x)))
+        output = self.in2(self.conv2(output))
+        output = torch.add(output,identity_data)
+        return output
+
+
+class Res2Block(nn.Module):
+
+    def __init__(self, n_feats=64, num=4, width=16):
+        super(Res2Block, self).__init__()
+        self.num = num
+        self.width = width
+
+        self.relu = nn.LeakyReLU(0.2)
+        self.top = nn.Sequential(
+            nn.Conv2d(in_channels=n_feats, out_channels=n_feats, kernel_size=1, stride=1, padding=0, bias=False),
+            nn.LeakyReLU(0.2),
+        )
+
+        convs = []
+        for i in range(self.num):
+            convs.append(nn.Conv2d(width, width, kernel_size=3, stride=1, padding=1, bias=False))
+        self.convs = nn.ModuleList(convs)
+        self.end = nn.Sequential(
+            nn.Conv2d(in_channels=n_feats, out_channels=n_feats, kernel_size=1, stride=1, padding=0, bias=False),
+            nn.LeakyReLU(0.2),
+        )
+
+    def forward(self, x):
+
+        out = self.top(x)
+
+        spx = torch.split(out, self.width, 1)
+        for i in range(self.num):
+            if i == 0:
+                sp = spx[i]
+            else:
+                sp = sp + spx[i]
+            sp = self.convs[i](sp)
+            sp = self.relu(sp)
+            if i == 0:
+                out = sp
+            else:
+                out = torch.cat((out, sp), 1)
+
+        out = self.end(out)
+
+        return out
+
+class MC_Block(nn.Module):
+    def __init__(self):
+        super(MC_Block, self).__init__()
+
+        self.conv1 = nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=1, padding=1, bias=False)
+        self.in1 = nn.InstanceNorm2d(64, affine=True)
+        self.conv2 = nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=1, padding=1, bias=False)
+        self.in2 = nn.InstanceNorm2d(64, affine=True)
+        self.conv3 = nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=1, padding=1, bias=False)
+        self.in3 = nn.InstanceNorm2d(64, affine=True)
+        self.conv4 = nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=1, padding=1, bias=False)
+        self.in4 = nn.InstanceNorm2d(64, affine=True)
+        self.relu = nn.LeakyReLU(0.2, inplace=True)
+        self.conv5 = nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=1, padding=1, bias=False)
+        self.in5 = nn.InstanceNorm2d(64, affine=True)
+        self.sigmoid = nn.Sigmoid()
+
+
+    def forward(self, f1, f2):
+        identity_data = self.sigmoid(f1 - f2)
+        jxr1 = self.relu(self.in1(self.conv1(identity_data)))
+        jxr2 = self.relu(self.in2(self.conv2(jxr1)))
+        jxr2 = self.relu(self.in3(self.conv3(jxr2)))
+        jxr2 = jxr2 + jxr1
+        output = self.relu(self.in4(self.conv4(jxr2)))
+        output = self.in2(self.conv2(output))
+        output = output * identity_data
+
+        return output
+
+
+class _NetBFSR(nn.Module):
+    def __init__(self, nf=64, nframes=5, groups=8, front_RBs=10, back_RBs=10, center=None,
+                 predeblur=False, HR_in=False, w_TSA=True):
+        super(_NetBFSR, self).__init__()
+        self.conv_input = nn.Conv2d(in_channels=3, out_channels=64, kernel_size=3, stride=1, padding=1, bias=False)
+        self.relu = nn.PReLU()
+        self.mc_block = MC_Block()
+
+        self.residual = self.make_layer(Res2Block, 24)
+        self.residual_pre = self.make_layer(Res2Block, 12)
+
+        self.conv_mid = nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn_mid = nn.InstanceNorm2d(64, affine=True)
+
+        self.upscale4x = nn.Sequential(
+            nn.Conv2d(in_channels=64, out_channels=256, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.PixelShuffle(2),
+            nn.PReLU(),
+            nn.Conv2d(in_channels=64, out_channels=256, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.PixelShuffle(2),
+            nn.PReLU(),
+        )
+        self.downscale4x = nn.Sequential(
+            nn.Conv2d(in_channels=3, out_channels=16, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.PReLU(),
+            nn.Conv2d(in_channels=16, out_channels=64, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.PReLU(),
+        )
+
+        self.conv_output = nn.Conv2d(in_channels=64, out_channels=3, kernel_size=3, stride=1, padding=1, bias=False)
+
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
+                m.weight.data.normal_(0, math.sqrt(2. / n))
+                if m.bias is not None:
+                    m.bias.data.zero_()
+
+    def make_layer(self, block, num_of_layer):
+        layers = []
+        for _ in range(num_of_layer):
+            layers.append(block())
+        return nn.Sequential(*layers)
+
+
+    def forward(self, x_p, x, x_n):
+
+        out = self.relu(self.conv_input(x))
+        # residual = out
+        f_p = self.downscale4x(x_p)
+        f_n = self.downscale4x(x_n)
+        out = self.residual_pre(out)
+        f_p = self.residual_pre(f_p)
+        f_n = self.residual_pre(f_n)
+
+        c_p = self.mc_block(f_p, out)
+        c_n = self.mc_block(out, f_n)
+        out = out + c_p + c_n
+        # residual = out
+        out = self.residual(out)
+        out = self.bn_mid(self.conv_mid(out))
+        # out = torch.add(out, residual)
+        out = self.upscale4x(out)
+        out = self.conv_output(out)
+        out = out + F.interpolate(x, scale_factor=4, mode='bilinear')
+
+        return out
+
+
+class _NetD(nn.Module):
+    def __init__(self):
+        super(_NetD, self).__init__()
+
+        self.conv_input = nn.Conv2d(in_channels=3, out_channels=64, kernel_size=3, stride=1, padding=1, bias=False)
+        self.relu = nn.LeakyReLU(0.2, inplace=True)
+
+
+        self.dfe1 = nn.Sequential(
+            nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.PReLU(),
+            nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.PReLU(),
+            nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=2, padding=1, bias=False),
+            # nn.PReLU(),
+            # nn.Conv2d(in_channels=64, out_channels=64, kernel_size=1, stride=1, padding=0, bias=False),
+        )
+        self.dfe2 = nn.Sequential(
+            nn.PReLU(),
+            nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.PReLU(),
+            nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.PReLU(),
+            nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.PReLU(),
+            nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.PReLU(),
+            nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.PReLU(),
+            nn.Conv2d(in_channels=64, out_channels=64, kernel_size=1, stride=1, padding=0, bias=False),
+            nn.Sigmoid()
+            # nn.Tanh()
+        )
+
+        self.dfc = nn.Sequential(
+            nn.Linear(64, 16),
+            nn.ReLU(inplace=True),
+            nn.Linear(16, 1)
+        )
+
+        # self.conv_R = nn.Conv2d(in_channels=64, out_channels=3, kernel_size=3, stride=1, padding=1, bias=False)
+
+
+    def forward(self, x):
+
+        idex = self.relu(self.conv_input(x))
+
+        a, b, _, _ = idex.size()
+        fee1 = self.dfe1(idex)
+
+        fee2 = self.dfe2(fee1).view(a,64)
+
+        result = self.dfc(fee2)
+
+        return result, fee1
+
+
+# Defines the GAN loss which uses either LSGAN or the regular GAN.
+class GANLoss(nn.Module):
+    def __init__(self, use_lsgan=True, target_real_label=1.0, target_fake_label=0.0,
+                 tensor=torch.FloatTensor):
+        super(GANLoss, self).__init__()
+        self.real_label = target_real_label
+        self.fake_label = target_fake_label
+        self.real_label_var = None
+        self.fake_label_var = None
+        self.Tensor = tensor
+        if use_lsgan:
+            self.loss = nn.MSELoss()
+        else:
+            self.loss = nn.BCELoss()
+
+    def get_target_tensor(self, input, target_is_real):
+        target_tensor = None
+        if target_is_real:
+            create_label = ((self.real_label_var is None) or
+                            (self.real_label_var.numel() != input.numel()))
+            if create_label:
+                real_tensor = self.Tensor(input.size()).fill_(self.real_label)
+                self.real_label_var = Variable(real_tensor, requires_grad=False)
+            target_tensor = self.real_label_var
+        else:
+            create_label = ((self.fake_label_var is None) or
+                            (self.fake_label_var.numel() != input.numel()))
+            if create_label:
+                fake_tensor = self.Tensor(input.size()).fill_(self.fake_label)
+                self.fake_label_var = Variable(fake_tensor, requires_grad=False)
+            target_tensor = self.fake_label_var
+        return target_tensor
+
+
+    def __call__(self, input, target_is_real):
+        target_tensor = self.get_target_tensor(input, target_is_real)
+        return self.loss(input, target_tensor.cuda())
+
+
+class GANLoss(nn.Module):
+    def __init__(self, use_lsgan=True, target_real_label=1.0, target_fake_label=0.0):
+        super(GANLoss, self).__init__()
+        self.register_buffer('real_label', torch.tensor(1.0))
+        self.register_buffer('fake_label', torch.tensor(0.0))
+        if use_lsgan:
+            self.loss = nn.MSELoss()
+        else:
+            self.loss = nn.BCELoss()
+
+    def get_target_tensor(self, input, target_is_real):
+        if target_is_real:
+            target_tensor = self.real_label
+            # target_tensor = 1
+        else:
+            target_tensor = self.fake_label
+            # target_tensor = 0
+        return target_tensor.expand_as(input)
+
+    def __call__(self, input, target_is_real):
+        target_tensor = self.get_target_tensor(input, target_is_real)
+        return self.loss(input, target_tensor.cuda())
+
+
+def print_network(net):
+    num_params = 0
+    for param in net.parameters():
+        num_params += param.numel()
+    print(net)
+    print('Total number of parameters: %d' % num_params)
+
+
+
+
+
+
